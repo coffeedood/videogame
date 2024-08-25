@@ -1,0 +1,476 @@
+import os
+import sys
+import math
+import random
+import itertools
+import pygame as pg
+
+from collections import namedtuple
+
+if sys.version_info[0] == 2:
+    range = xrange
+
+CAPTION = "Ray-Casting with Python"
+SCREEN_SIZE = (1200, 600)
+CIRCLE = 2 * math.pi
+SCALE = (SCREEN_SIZE[0] + SCREEN_SIZE[1]) / 1200.0
+FIELD_OF_VIEW = math.pi * 0.4
+NO_WALL = float("inf")
+RAIN_COLOR = (255, 255, 255, 40)
+
+# Semantically meaningful tuples for use in GameMap and Camera class.
+RayInfo = namedtuple("RayInfo", ["sin", "cos"])
+WallInfo = namedtuple("WallInfo", ["top", "height"])
+
+
+class Image(object):
+    """A very basic class that couples an image with its dimensions"""
+
+    def __init__(self, image):
+        """
+        The image argument is a preloaded and converted pg.Surface object.
+        """
+        self.image = image
+        self.width, self.height = self.image.get_size()
+
+
+class Player(object):
+    """Handles the player's position, rotation, and control."""
+
+    def __init__(self, x, y, direction):
+        """
+        The arguments x and y are floating points.  Anything between zero
+        and the game map size is on our generated map.
+        Choosing a point outside this range ensures our player doesn't spawn
+        inside a wall.  The direction argument is the initial angle (given in
+        radians) of the player.
+        """
+        self.x = x
+        self.y = y
+        self.direction = direction
+        self.speed = 2.0  # Map cells per second, reduced speed.
+        self.rotate_speed = CIRCLE / 2  # 180 degrees in a second.
+        self.weapon = Image(IMAGES["knife"])
+        self.paces = 0  # Used for weapon placement.
+
+    def rotate(self, angle):
+        """Change the player's direction when appropriate key is pressed."""
+        self.direction = (self.direction + angle + CIRCLE) % CIRCLE
+
+    def walk(self, distance, game_map):
+        """
+        Calculate the player's next position, and move if he will
+        not end up inside a wall.
+        """
+        dx = math.cos(self.direction) * distance
+        dy = math.sin(self.direction) * distance
+        if game_map.get(self.x + dx, self.y) <= 0:
+            self.x += dx
+        if game_map.get(self.x, self.y + dy) <= 0:
+            self.y += dy
+        self.paces += distance
+
+    def update(self, keys, dt, game_map):
+        """Execute movement functions if the appropriate key is pressed."""
+        if keys[pg.K_LEFT]:
+            self.rotate(-self.rotate_speed * dt)
+        if keys[pg.K_RIGHT]:
+            self.rotate(self.rotate_speed * dt)
+        if keys[pg.K_UP]:
+            self.walk(self.speed * dt, game_map)
+        if keys[pg.K_DOWN]:
+            self.walk(-self.speed * dt, game_map)
+        # Debugging
+        print(f"Position: ({self.x}, {self.y}), Direction: {self.direction}")
+
+
+class NPC(object):
+    """Handles the NPC's position, rotation, and basic AI."""
+
+    def __init__(self, x, y, direction):
+        self.x = x
+        self.y = y
+        self.direction = direction
+        self.speed = 1.5  # NPC speed is slightly slower than the player
+        self.paces = 0
+
+    def rotate(self, angle):
+        """Rotate the NPC in the specified direction."""
+        self.direction = (self.direction + angle + CIRCLE) % CIRCLE
+
+    def walk(self, distance, game_map):
+        """Move the NPC forward if it doesn't collide with a wall."""
+        dx = math.cos(self.direction) * distance
+        dy = math.sin(self.direction) * distance
+        if game_map.get(self.x + dx, self.y) <= 0:
+            self.x += dx
+        if game_map.get(self.x, self.y + dy) <= 0:
+            self.y += dy
+        self.paces += distance
+
+    def update(self, dt, game_map, player):
+        """Basic AI for the NPC to follow the player."""
+        angle_to_player = math.atan2(player.y - self.y, player.x - self.x)
+        self.direction = angle_to_player
+        self.walk(self.speed * dt, game_map)
+        # Debugging
+        print(f"NPC Position: ({self.x}, {self.y}), Direction: {self.direction}")
+
+
+class GameMap(object):
+    """
+    A class to generate a random map for us; handle ray casting;
+    and provide a method of detecting collisions.
+    """
+
+    def __init__(self, size):
+        """
+        The size argument is an integer which tells us the width and height
+        of our game grid.  For example, a size of 32 will create a 32x32 map.
+        """
+        self.size = size
+        self.wall_grid = self.randomize()
+        self.sky_box = Image(IMAGES["sky"])
+        self.wall_texture = Image(IMAGES["texture"])
+        self.light = 0
+
+    def get(self, x, y):
+        """A method to check if a given coordinate is colliding with a wall."""
+        point = (int(math.floor(x)), int(math.floor(y)))
+        return self.wall_grid.get(point, -1)
+
+    def randomize(self):
+        """
+        Generate our map randomly.  In the code below there is a 30% chance
+        of a cell containing a wall.
+        """
+        coordinates = itertools.product(range(self.size), repeat=2)
+        return {coord: random.random() < 0.3 for coord in coordinates}
+
+    def cast_ray(self, point, angle, cast_range):
+        """
+        The meat of our ray casting program.  Given a point,
+        an angle (in radians), and a maximum cast range, check if any
+        collisions with the ray occur.  Casting will stop if a collision is
+        detected (cell with greater than 0 height), or our maximum casting
+        range is exceeded without detecting anything.
+        """
+        info = RayInfo(math.sin(angle), math.cos(angle))
+        origin = Point(point)
+        ray = [origin]
+        while origin.height <= 0 and origin.distance <= cast_range:
+            dist = origin.distance
+            step_x = origin.step(info.sin, info.cos)
+            step_y = origin.step(info.cos, info.sin, invert=True)
+            if step_x.length < step_y.length:
+                next_step = step_x.inspect(info, self, 1, 0, dist, step_x.y)
+            else:
+                next_step = step_y.inspect(info, self, 0, 1, dist, step_y.x)
+            ray.append(next_step)
+            origin = next_step
+        return ray
+
+    def update(self, dt):
+        """Adjust ambient lighting based on time."""
+        if self.light > 0:
+            self.light = max(self.light - 10 * dt, 0)
+        elif random.random() * 5 < dt:
+            self.light = 2
+
+
+class Point(object):
+    """
+    A fairly basic class to assist us with ray casting.  The return value of
+    the GameMap.cast_ray() method is a list of Point instances.
+    """
+
+    def __init__(self, point, length=None):
+        self.x = point[0]
+        self.y = point[1]
+        self.height = 0
+        self.distance = 0
+        self.shading = None
+        self.length = length
+
+    def step(self, rise, run, invert=False):
+        """
+        Return a new Point advanced one step from the caller.  If run is
+        zero, the length of the new Point will be infinite.
+        """
+        try:
+            x, y = (self.y, self.x) if invert else (self.x, self.y)
+            dx = math.floor(x + 1) - x if run > 0 else math.ceil(x - 1) - x
+            dy = dx * (rise / run)
+            next_x = y + dy if invert else x + dx
+            next_y = x + dx if invert else y + dy
+            length = math.hypot(dx, dy)
+        except ZeroDivisionError:
+            next_x = next_y = None
+            length = NO_WALL
+        return Point((next_x, next_y), length)
+
+    def inspect(self, info, game_map, shift_x, shift_y, distance, offset):
+        """
+        Ran when the step is selected as the next in the ray.
+        Sets the steps self.height, self.distance, and self.shading,
+        to the required values.
+        """
+        dx = shift_x if info.cos < 0 else 0
+        dy = shift_y if info.sin < 0 else 0
+        self.height = game_map.get(self.x - dx, self.y - dy)
+        self.distance = distance + self.length
+        if shift_x:
+            self.shading = 2 if info.cos < 0 else 0
+        else:
+            self.shading = 2 if info.sin < 0 else 1
+        self.offset = offset - math.floor(offset)
+        return self
+
+
+class Camera(object):
+    """Handles the projection and rendering of all objects on the screen."""
+
+    def __init__(self, screen, resolution):
+        self.screen = screen
+        self.width, self.height = self.screen.get_size()
+        self.resolution = float(resolution)
+        self.spacing = self.width / resolution
+        self.field_of_view = FIELD_OF_VIEW
+        self.range = 8
+        self.light_range = 5
+        self.scale = SCALE
+        self.flash = pg.Surface((self.width, self.height // 2)).convert_alpha()
+
+    def render(self, player, game_map, npcs):
+        """Render everything in order."""
+        self.draw_sky(player.direction, game_map.sky_box, game_map.light)
+        self.draw_columns(player, game_map)
+        self.draw_weapon(player.weapon, player.paces)
+        self.draw_minimap(player, game_map, npcs)
+        self.draw_npcs(npcs, player)  # Pass player to draw_npcs method
+        self.draw_topdown_map(player, game_map, npcs)  # New top-down map rendering
+
+    def draw_sky(self, direction, sky_box, ambient):
+        """Draws the skybox and adjusts its color based on the ambient light."""
+        r = min(max(int(ambient * 160), 0), 255)
+        g = min(max(int(ambient * 192), 0), 255)
+        b = min(max(int(ambient * 255), 0), 255)
+        a = min(max(int(ambient * 255 // 2), 0), 255)
+        
+        self.flash.fill((r, g, b, a))
+        # Additional code to draw the skybox goes here...
+
+
+    def draw_columns(self, player, game_map):
+        """Render the 3D walls by projecting them against the camera."""
+        angle = player.direction - (self.field_of_view / 2)
+        for col in range(int(self.resolution)):
+            ray = game_map.cast_ray((player.x, player.y), angle, self.range)
+            self.draw_column(col, ray, angle, game_map.wall_texture, game_map.light)
+            angle += self.field_of_view / self.resolution
+
+    def draw_minimap(self, player, game_map, npcs):
+        """Render a small minimap on the screen."""
+        minimap_size = 200  # Size of the minimap
+        minimap_surface = pg.Surface((minimap_size, minimap_size))
+        minimap_surface.fill((50, 50, 50))  # Background color
+
+        cell_size = minimap_size / game_map.size
+
+        # Draw the walls
+        for x in range(game_map.size):
+            for y in range(game_map.size):
+                if game_map.get(x, y) > 0:
+                    pg.draw.rect(minimap_surface, (0, 0, 255), (x*cell_size, y*cell_size, cell_size, cell_size))
+
+        # Draw the player position
+        player_x_map = player.x * cell_size
+        player_y_map = player.y * cell_size
+        pg.draw.circle(minimap_surface, (255, 0, 0), (int(player_x_map), int(player_y_map)), 3)
+
+        # Draw NPC positions
+        for npc in npcs:
+            npc_x_map = npc.x * cell_size
+            npc_y_map = npc.y * cell_size
+            pg.draw.circle(minimap_surface, (0, 255, 0), (int(npc_x_map), int(npc_y_map)), 3)
+
+        # Draw the minimap on the screen
+        self.screen.blit(minimap_surface, (10, 10))
+
+    def draw_topdown_map(self, player, game_map, npcs):
+        """Render a top-down view of the entire map."""
+        topdown_map_size = min(self.width, self.height)  # Make the map as large as possible within screen size
+        topdown_map_surface = pg.Surface((topdown_map_size, topdown_map_size))
+        topdown_map_surface.fill((50, 50, 50))  # Background color
+
+        cell_size = topdown_map_size / game_map.size
+
+        # Draw the walls
+        for x in range(game_map.size):
+            for y in range(game_map.size):
+                if game_map.get(x, y) > 0:
+                    pg.draw.rect(topdown_map_surface, (0, 0, 255), (x*cell_size, y*cell_size, cell_size, cell_size))
+
+        # Draw the player position
+        player_x_map = player.x * cell_size
+        player_y_map = player.y * cell_size
+        pg.draw.circle(topdown_map_surface, (255, 0, 0), (int(player_x_map), int(player_y_map)), 5)
+
+        # Draw NPC positions
+        for npc in npcs:
+            npc_x_map = npc.x * cell_size
+            npc_y_map = npc.y * cell_size
+            pg.draw.circle(topdown_map_surface, (0, 255, 0), (int(npc_x_map), int(npc_y_map)), 5)
+
+        # Draw the top-down map on the screen
+        self.screen.blit(topdown_map_surface, (self.width // 2 - topdown_map_size // 2, self.height // 2 - topdown_map_size // 2))
+
+    def draw_column(self, col, ray, angle, texture, ambient):
+        """Render the vertical projection of a single wall slice."""
+        step = 1 * SCALE
+        width = int(math.ceil(self.spacing))  # Ensure width is an integer
+        ray_count = len(ray) - 1
+
+        for s in reversed(range(ray_count)):
+            wall = self.project(col, ray[s], angle, step)
+            if wall.height <= 0:
+                continue
+            
+            texture_x = int(texture.width * ray[s].offset)
+            shade = 255 / (1 + ray[s].distance * ray[s].distance * 0.0001)
+            shade = shade * (0.75 + 0.25 * (s / ray_count))
+            if ambient > 0:
+                shade = shade * (1 - ambient) + ambient * 255
+            
+            # Cap shade within 0-255 range
+            shade = max(0, min(255, shade))
+
+            # Debug output
+            print(f"Width: {width}, Wall Height: {wall.height}, Shade: {shade}")
+
+            # Ensure wall.height is a positive integer
+            height = int(wall.height)
+            if height <= 0:
+                continue
+            
+            # Ensure column dimensions are valid
+            column = texture.image.subsurface(texture_x, 0, 1, texture.height)
+            try:
+                column = pg.transform.scale(column, (width, height))
+            except Exception as e:
+                print(f"Error scaling column: {e}")
+                continue
+            
+            # Ensure that shading values are valid integers
+            shade_color = (int(shade), int(shade), int(shade))
+            column.fill(shade_color, special_flags=pg.BLEND_MULT)
+            
+            self.screen.blit(column, (col * self.spacing, int(wall.top)))
+
+
+
+
+    def draw_weapon(self, weapon, paces):
+        """Render the player's weapon on the screen."""
+        bob_x = math.cos(paces * 2) * self.scale * 6
+        bob_y = math.sin(paces * 4) * self.scale * 6
+        left = self.width * 0.66 + bob_x
+        top = self.height * 0.6 + bob_y
+        self.screen.blit(weapon.image, (left, top))
+
+    def draw_npcs(self, npcs, player):
+        """Render NPCs on the screen."""
+        for npc in npcs:
+            dx = npc.x - player.x
+            dy = npc.y - player.y
+            dist = math.hypot(dx, dy)
+            angle = math.atan2(dy, dx) - player.direction
+            if dist < 0.5 or abs(angle) > self.field_of_view / 2:
+                continue
+            height = self.height / dist
+            npc_width = height * npc.paces / 2
+            npc_height = height
+            top = self.height / 2 - height / 2
+            left = (angle / self.field_of_view + 0.5) * self.width - npc_width / 2
+            if 0 < left < self.width:
+                color = (255, 0, 0)  # Red NPC color
+                npc_surface = pg.Surface((int(npc_width), int(npc_height)))
+                npc_surface.fill(color)
+                self.screen.blit(npc_surface, (left, top))
+
+    def project(self, col, point, angle, step):
+        """Convert our ray's intersection with the game map to a wall slice."""
+        z = point.distance * math.cos(angle)
+        
+        # Avoid division by zero
+        if z == 0:
+            z = 0.0001  # Set to a small value to avoid division by zero
+        
+        wall_height = self.height * point.height / z
+        bottom = self.height / 2 * (1 + 1 / z)
+        return WallInfo(bottom - wall_height, wall_height)
+
+
+
+class Control(object):
+    """The control object handles our event loop and game logic."""
+
+    def __init__(self, screen):
+        self.screen = screen
+        self.clock = pg.time.Clock()
+        self.delta_time = 0
+        self.player = Player(15.3, -1.2, math.pi * 0.3)
+        self.npcs = [NPC(10.5, 5.5, 0), NPC(15.5, 10.5, 0)]
+        self.game_map = GameMap(32)
+        self.camera = Camera(self.screen, 320)
+
+    def event_loop(self):
+        """Keypresses, etc."""
+        for event in pg.event.get():
+            if event.type == pg.QUIT:
+                self.quit()
+
+    def quit(self):
+        pg.quit()
+        sys.exit()
+
+    def update(self):
+        """Update our main loop variables."""
+        keys = pg.key.get_pressed()
+        self.player.update(keys, self.delta_time, self.game_map)
+        for npc in self.npcs:
+            npc.update(self.delta_time, self.game_map, self.player)
+        self.game_map.update(self.delta_time)
+
+    def display_fps(self):
+        """Display the current FPS."""
+        caption = "{} - {:.2f} FPS".format(CAPTION, self.clock.get_fps())
+        pg.display.set_caption(caption)
+
+    def run(self):
+        """Run the main loop."""
+        while True:
+            self.delta_time = self.clock.tick(60) / 1000.0
+            self.event_loop()
+            self.update()
+            self.camera.render(self.player, self.game_map, self.npcs)
+            pg.display.update()
+            self.display_fps()
+
+
+def main():
+    """Initialize, load our resources, and begin the main loop."""
+    global IMAGES
+    os.environ["SDL_VIDEO_CENTERED"] = "1"
+    pg.init()
+    pg.display.set_mode(SCREEN_SIZE)
+    IMAGES = {
+        "sky": pg.image.load("sky.jpg").convert(),
+        "texture": pg.image.load("wall.jpg").convert(),
+        "knife": pg.image.load("knife.png").convert_alpha(),
+    }
+    Control(pg.display.get_surface()).run()
+
+
+if __name__ == "__main__":
+    main()
